@@ -16,5 +16,5 @@ Search for git repositories from your terminal.
 + Get information on authors
 + File Explorer for raw repository files
 + Issue Explorer
-
++ Toml user configuration
 
