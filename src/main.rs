@@ -1,0 +1,295 @@
+use crossterm::event::{self as ctevent, Event as CTEvent, KeyCode, KeyEvent, KeyEventKind};
+use crossterm::{
+    execute,
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+};
+use ratatui;
+use ratatui::backend::CrosstermBackend as Backend;
+use ratatui::style::Stylize;
+use ratatui::text::{Line, Span, Text};
+use ratatui::widgets::{Row, Table, TableState};
+mod git;
+use git::get_something;
+mod event;
+use event::{Event, EventHandler};
+
+#[tokio::main]
+async fn main() {
+    enable_raw_mode();
+    execute!(std::io::stderr(), EnterAlternateScreen);
+    let events = EventHandler::new(100);
+    let mut terminal = ratatui::Terminal::new(Backend::new(std::io::stderr())).unwrap();
+    App::new(events).run(&mut terminal).await;
+    execute!(std::io::stderr(), LeaveAlternateScreen);
+    disable_raw_mode();
+}
+
+#[derive(Default)]
+enum Mode {
+    #[default]
+    Normal,
+    Input,
+    Table,
+}
+
+enum GitResults {
+    RepositoryList(Vec<octocrab::models::Repository>),
+    Repository(octocrab::models::Repository),
+    None,
+}
+
+enum SelectionMode {
+    None,
+    TableState(TableState),
+}
+
+pub fn format_repo<'a>(repo: octocrab::models::Repository) -> [Span<'a>; 4] {
+    [
+        repo.name.clone().light_green(),
+        if let Some(owner) = repo.owner {
+            owner.login.light_green()
+        } else {
+            "***".red()
+        },
+        if let Some(description) = repo.description {
+            description.gray()
+        } else {
+            "".into()
+        },
+        if let Some(stars) = repo.stargazers_count {
+            stars.to_string().yellow()
+        } else {
+            "0".yellow()
+        },
+    ]
+}
+
+pub struct App {
+    quit: bool,
+    buffer: Vec<u8>,
+    mode: Mode,
+    events: EventHandler,
+    body: GitResults,
+    search: bool,
+    selection_mode: SelectionMode,
+}
+
+impl App {
+    pub fn new(events: EventHandler) -> Self {
+        Self {
+            quit: false,
+            buffer: Vec::new(),
+            mode: Mode::Normal,
+            events,
+            body: GitResults::None,
+            search: false,
+            selection_mode: SelectionMode::None,
+        }
+    }
+
+    pub async fn run(
+        &mut self,
+        terminal: &mut ratatui::Terminal<Backend<std::io::Stderr>>,
+    ) -> std::io::Result<()> {
+        while !self.quit {
+            terminal.draw(|frame| self.render(frame))?;
+            if self.search {
+                self.search_repo().await;
+            }
+            self.handle_events().await;
+        }
+        Ok(())
+    }
+
+    pub fn render(&mut self, frame: &mut ratatui::Frame) {
+        use ratatui::layout::{
+            Constraint::{Fill, Length, Min},
+            Layout,
+        };
+        use ratatui::text::Line;
+        use ratatui::widgets::{Block, Paragraph};
+
+        let vertical = Layout::vertical([Min(0), Length(1)]);
+        let [main_area, input_area] = vertical.areas(frame.area());
+
+        let main_block = Block::bordered().title(match self.mode {
+            Mode::Input => "Search",
+            Mode::Normal => "<Esc> to quit",
+            Mode::Table => "Table Select",
+            _ => "Unimplemented Mode!",
+        });
+
+        let buffer = if !self.search {
+            String::from_utf8(self.buffer.clone())
+                .expect("Invalid Char")
+                .bold()
+        } else {
+            "Searching...".bold()
+        };
+
+        let text = match self.mode {
+            Mode::Input => Line::from(vec!["> ".bold(), buffer.into()]).white(),
+            _ => format!("> {} - Press '/' to edit", buffer)
+                .dark_gray()
+                .into(),
+        };
+        frame.render_widget(Paragraph::new(text), input_area);
+
+        use ratatui::layout::{Constraint, Rect};
+        use ratatui::style::{Color, Style, Stylize};
+        match &self.body {
+            GitResults::None => frame.render_widget(Paragraph::new(Text::from(vec![
+                        Line::from(" _____ _ _____    _____ _____ ____  _      _  _      ____  _".red()),
+                        Line::from("/  __// Y__ __\\  /__ __Y  __//  __\\/ \\__/|/ \\/ \\  /|/  _ \\/ \\".yellow()),
+                        Line::from("| |  _| | / \\      / \\ |  \\  |  \\/|| |\\/||| || |\\ ||| / \\|| |     ".green()),
+                        Line::from("| |_//| | | |      | | |  /_ |    /| |  ||| || | \\||| |-||| |_/\\".cyan()),
+                        Line::from("\\____\\\\_/ \\_/      \\_/ \\____\\\\_/\\_\\\\_/  \\|\\_/\\_/  \\|\\_/ \\|\\____/  ".blue()),
+                        Line::from("                                                                  ".magenta()),
+                        Line::from(" ________  _ ____  _     ____  ____  _____ ____                   ".red()),
+                        Line::from("/  __/\\  \\///  __\\/ \\   /  _ \\/  __\\/  __//  __\\                  ".yellow()),
+                        Line::from("|  \\   \\  / |  \\/|| |   | / \\||  \\/||  \\  |  \\/|                  ".green()),
+                        Line::from("|  /_  /  \\ |  __/| |_/\\| \\_/||    /|  /_ |    /                  ".cyan()),
+                        Line::from("\\____\\/__/\\\\\\_/   \\____/\\____/\\_/\\_\\\\____\\\\_/\\_\\".blue()),
+                        Line::from("\t- Ashley".magenta()),
+            ])).block(main_block), main_area),
+            GitResults::RepositoryList(items) => {
+                let rows = items.into_iter().map(|i| {
+                    Row::new(format_repo(i.clone()))
+
+                }).collect::<Vec<Row>>();
+
+                let header = Row::new(["Repository", "Author", "description", "Stars"])
+                    .style(Style::new().bold());
+
+                let widths = [
+                    Constraint::Percentage(35),
+                    Constraint::Percentage(20),
+                    Constraint::Percentage(38),
+                    Constraint::Percentage(7),
+                ];                
+                let table = Table::new(rows, widths)
+                    .header(header)
+                    .column_spacing(1)
+                    .cell_highlight_style(Style::new().bold().white())
+                    .block(main_block);
+
+                if let SelectionMode::TableState(table_state) = &mut self.selection_mode {
+                    frame.render_stateful_widget(table, main_area, table_state);
+                }
+                else {
+                    frame.render_widget(table, main_area);
+                }
+            }
+            GitResults::Repository(item) => {
+                use ratatui::layout::Alignment;
+                let l = Layout::vertical([Length(3), Length(1), Min(0)]);
+                let [name_area, info_area, description_area] = l.areas(main_area);
+                let paragraph = Paragraph::new(format!("{} {}", item.name.clone().bold().white(), if let Some(description) = &item.description {
+                        format!("- {}", description.clone().gray())
+                    } else {"".into()}))
+                    .alignment(Alignment::Center)
+                    .block(Block::bordered());
+                frame.render_widget(paragraph, name_area);
+                
+
+                let text = format!("URL: {}", item.url.as_str().clone().white());
+
+                frame.render_widget(Paragraph::new(text).block(Block::bordered()), description_area);
+            }
+        }
+    }
+
+    pub async fn handle_events(&mut self) -> std::io::Result<()> {
+        match self.events.next().await.unwrap() {
+            Event::Key(key) if key.kind == KeyEventKind::Press => match self.mode {
+                Mode::Normal => self.normal_mode_event(key.code).await,
+                Mode::Input => self.input_mode_event(key.code).await,
+                Mode::Table => self.table_mode_event(key.code),
+                _ => self.default_mode_event(key.code).await,
+            },
+            _ => {}
+        }
+        Ok(())
+    }
+
+    pub async fn normal_mode_event(&mut self, key: KeyCode) {
+        match key {
+            KeyCode::Esc => self.stop().await,
+            KeyCode::Char('/') => self.mode = Mode::Input,
+            KeyCode::Enter => self.mode = Mode::Table,
+            _ => {}
+        }
+    }
+
+    pub async fn stop(&mut self) {
+        let _ = self.events.stop().await;
+        self.quit = true;
+    }
+
+    pub async fn default_mode_event(&mut self, key: KeyCode) {
+        match key {
+            KeyCode::Esc => self.mode = Mode::Normal,
+            _ => {}
+        }
+    }
+
+    pub fn table_mode_event(&mut self, key: KeyCode) {
+        if let SelectionMode::TableState(table_state) = &mut self.selection_mode {
+            match key {
+                KeyCode::Up => table_state.select_previous(),
+                KeyCode::Down => table_state.select_next(),
+                KeyCode::Right => table_state.select_next_column(),
+                KeyCode::Left => table_state.select_previous_column(),
+                KeyCode::Esc => self.mode = Mode::Normal,
+                KeyCode::Enter => {
+                    let r = table_state.selected();
+                    if let Some(index) = r {
+                        match &self.body {
+                            GitResults::RepositoryList(items) => {
+                                let wanted = items[index].clone();
+                                self.body = GitResults::Repository(wanted);
+                                self.selection_mode = SelectionMode::TableState(TableState::default());
+                            }
+                            GitResults::Repository(item) => {},
+                            GitResults::None => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+        } else {
+            self.mode = Mode::Normal;
+        }
+    }
+
+    pub async fn input_mode_event(&mut self, key: KeyCode) {
+        match key {
+            KeyCode::Esc => self.mode = Mode::Normal,
+            KeyCode::Char(c) => self.buffer.push(c as u8),
+            KeyCode::Backspace => {
+                self.buffer.pop();
+            }
+            KeyCode::Enter => self.search = true,
+            _ => {}
+        }
+    }
+
+    pub async fn search_repo(&mut self) {
+        let page = octocrab::instance()
+            .search()
+            .repositories(&String::from_utf8(self.buffer.clone()).expect("asdjkashfd"))
+            .sort("stars")
+            .order("desc")
+            .per_page(100)
+            .send()
+            .await
+            .unwrap();
+        self.body = GitResults::RepositoryList(page.items);
+        self.search = false;
+        self.mode = Mode::Table;
+        let mut table_state = TableState::default();
+        table_state.select_first();
+        table_state.select_first_column();
+        self.selection_mode = SelectionMode::TableState(table_state);
+    }
+}
