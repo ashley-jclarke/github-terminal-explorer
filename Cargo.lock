@@ -894,10 +894,12 @@ dependencies = [
  "color-eyre",
  "crossterm",
  "futures",
+ "http",
  "octocrab",
  "ratatui",
  "tokio",
  "tokio-util",
+ "url",
 ]
 
 [[package]]

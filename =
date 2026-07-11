@@ -5,13 +5,11 @@ use crossterm::{
 };
 use ratatui;
 use ratatui::backend::CrosstermBackend as Backend;
-use ratatui::style::{Stylize, Style};
+use ratatui::style::Stylize;
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Row, Table, TableState};
-use ratatui::layout::{Constraint, Layout, Margin, Rect};
 mod git;
-use git::{Explorer, GithubResult};
-
+// use git::get_something;
 mod event;
 use event::{Event, EventHandler};
 
@@ -32,6 +30,12 @@ enum Mode {
     Normal,
     Input,
     Table,
+}
+
+enum GitResults {
+    RepositoryList(Vec<octocrab::models::Repository>),
+    Repository(octocrab::models::Repository),
+    None,
 }
 
 enum SelectionMode {
@@ -65,7 +69,7 @@ pub struct App {
     buffer: Vec<u8>,
     mode: Mode,
     events: EventHandler,
-    explorer: Explorer,
+    body: GitResults,
     search: bool,
     selection_mode: SelectionMode,
 }
@@ -77,7 +81,7 @@ impl App {
             buffer: Vec::new(),
             mode: Mode::Normal,
             events,
-            explorer: Explorer::new(),
+            body: GitResults::None,
             search: false,
             selection_mode: SelectionMode::None,
         }
@@ -133,12 +137,8 @@ impl App {
 
         use ratatui::layout::{Constraint, Rect};
         use ratatui::style::{Color, Style, Stylize};
-        match &self.explorer.current_page {
-
-            GithubResult::Page(page) => {
-                self.render_page(frame, main_area)
-            }
-            _ => frame.render_widget(Paragraph::new(Text::from(vec![
+        match &self.body {
+            GitResults::None => frame.render_widget(Paragraph::new(Text::from(vec![
                         Line::from(" _____ _ _____    _____ _____ ____  _      _  _      ____  _".red()),
                         Line::from("/  __// Y__ __\\  /__ __Y  __//  __\\/ \\__/|/ \\/ \\  /|/  _ \\/ \\".yellow()),
                         Line::from("| |  _| | / \\      / \\ |  \\  |  \\/|| |\\/||| || |\\ ||| / \\|| |     ".green()),
@@ -152,7 +152,50 @@ impl App {
                         Line::from("\\____\\/__/\\\\\\_/   \\____/\\____/\\_/\\_\\\\____\\\\_/\\_\\".blue()),
                         Line::from("\t- Ashley".magenta()),
             ])).block(main_block), main_area),
-            
+            GitResults::RepositoryList(items) => {
+                let rows = items.into_iter().map(|i| {
+                    Row::new(format_repo(i.clone()))
+
+                }).collect::<Vec<Row>>();
+
+                let header = Row::new(["Repository", "Author", "description", "Stars"])
+                    .style(Style::new().bold());
+
+                let widths = [
+                    Constraint::Percentage(35),
+                    Constraint::Percentage(20),
+                    Constraint::Percentage(38),
+                    Constraint::Percentage(7),
+                ];                
+                let table = Table::new(rows, widths)
+                    .header(header)
+                    .column_spacing(1)
+                    .cell_highlight_style(Style::new().bold().white())
+                    .block(main_block);
+
+                if let SelectionMode::TableState(table_state) = &mut self.selection_mode {
+                    frame.render_stateful_widget(table, main_area, table_state);
+                }
+                else {
+                    frame.render_widget(table, main_area);
+                }
+            }
+            GitResults::Repository(item) => {
+                use ratatui::layout::Alignment;
+                let l = Layout::vertical([Length(3), Length(1), Min(0)]);
+                let [name_area, info_area, description_area] = l.areas(main_area);
+                let paragraph = Paragraph::new(format!("{} {}", item.name.clone().bold().white(), if let Some(description) = &item.description {
+                        format!("- {}", description.clone().gray())
+                    } else {"".into()}))
+                    .alignment(Alignment::Center)
+                    .block(Block::bordered());
+                frame.render_widget(paragraph, name_area);
+                
+
+                let text = format!("URL: {}", item.url.as_str().clone().white());
+
+                frame.render_widget(Paragraph::new(text).block(Block::bordered()), description_area);
+            }
         }
     }
 
@@ -201,12 +244,14 @@ impl App {
                 KeyCode::Enter => {
                     let r = table_state.selected();
                     if let Some(index) = r {
-                        match &self.explorer.current_page {
-                            GithubResult::Page(page) => {
-                                let wanted = page.items[index].clone();
+                        match &self.body {
+                            GitResults::RepositoryList(items) => {
+                                let wanted = items[index].clone();
+                                self.body = GitResults::Repository(wanted);
+                                self.selection_mode = SelectionMode::TableState(TableState::default());
                             }
-                            GithubResult::Repository(item) => {}
-                            GithubResult::None => {}
+                            GitResults::Repository(item) => {},
+                            GitResults::None => {}
                         }
                     }
                 }
@@ -230,43 +275,21 @@ impl App {
     }
 
     pub async fn search_repo(&mut self) {
-        self.explorer.search_repo(&String::from_utf8(self.buffer.clone()).expect("asdjkashfd")).await;
-            
+        let page = octocrab::instance()
+            .search()
+            .repositories(&String::from_utf8(self.buffer.clone()).expect("asdjkashfd"))
+            .sort("stars")
+            .order("desc")
+            .per_page(100)
+            .send()
+            .await
+            .unwrap();
+        self.body = GitResults::RepositoryList(page.items);
         self.search = false;
         self.mode = Mode::Table;
         let mut table_state = TableState::default();
         table_state.select_first();
         table_state.select_first_column();
         self.selection_mode = SelectionMode::TableState(table_state);
-    }
-    fn render_page(&mut self, frame: &mut ratatui::Frame, area: Rect) {
-        let GithubResult::Page(page) = &self.explorer.current_page else {return};
-        let items = &page.items;
-        let rows = items.into_iter().map(|i| {
-            Row::new(format_repo(i.clone()))
-
-        }).collect::<Vec<Row>>();
-
-        let header = Row::new(["Repository", "Author", "description", "Stars"])
-                    .style(Style::new().bold());
-
-        let widths = [
-                    Constraint::Percentage(35),
-                    Constraint::Percentage(20),
-                    Constraint::Percentage(38),
-                    Constraint::Percentage(7),
-                ];                
-        let table = Table::new(rows, widths)
-                    .header(header)
-                    .column_spacing(1)
-                    .cell_highlight_style(Style::new().bold().white())
-                    ;
-
-        if let SelectionMode::TableState(table_state) = &mut self.selection_mode {
-            frame.render_stateful_widget(table, area, table_state);
-        }
-        else {
-            frame.render_widget(table, area);
-        }
     }
 }
